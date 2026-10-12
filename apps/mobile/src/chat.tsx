@@ -214,9 +214,15 @@ export function ChatScreen({
 }) {
   const { api, workspace: w, refresh, navigate } = useWorkspace();
   const { data: agentWorkspace, refresh: refreshAgent } = useAgentWorkspace();
-  const { enabled: richThreads, mainId, claimPrompt } = useMuseThread();
+  const {
+    enabled: threadedConversations,
+    rich: richThreads,
+    local: localThreads,
+    mainId,
+    claimPrompt,
+  } = useMuseThread();
   const selection = thread || { id: "local", existing: false };
-  const threadId = richThreads ? selection.id : "local-main";
+  const threadId = threadedConversations ? selection.id : "local-main";
   const agentId = `openmuse-${threadId}`;
   const { agent, isReady } = useAgent({ agentId, runtimeAgentId: "default", threadId });
   const { copilotkit } = useCopilotKit();
@@ -296,6 +302,11 @@ export function ChatScreen({
               if (active) setSyncing(false);
             }
           }
+        } else if (localThreads) {
+          const conversation = await api.request<{ messages: Message[] }>(
+            `/api/conversations/${encodeURIComponent(threadId)}`,
+          );
+          if (active) agent.setMessages(conversation.messages);
         } else {
           const { messages } = await api.request<{ messages: Message[] }>("/api/conversation");
           if (active) agent.setMessages(messages);
@@ -316,11 +327,29 @@ export function ChatScreen({
       replay.unsubscribe();
       if (richThreads) void agent.detachActiveRun().catch(() => {});
     };
-  }, [agent, agentId, api, copilotkit, isReady, historyAttempt, richThreads, selection.existing]);
+  }, [
+    agent,
+    agentId,
+    api,
+    copilotkit,
+    isReady,
+    historyAttempt,
+    richThreads,
+    localThreads,
+    selection.existing,
+    threadId,
+  ]);
   const saveHistory = useCallback(async () => {
-    if (!richThreads) await api.request("/api/conversation", { messages: agent.messages }, "PUT");
+    if (localThreads)
+      await api.request(
+        `/api/conversations/${encodeURIComponent(threadId)}`,
+        { messages: agent.messages },
+        "PUT",
+      );
+    else if (!richThreads)
+      await api.request("/api/conversation", { messages: agent.messages }, "PUT");
     setSaveError("");
-  }, [agent, api, richThreads]);
+  }, [agent, api, localThreads, richThreads, threadId]);
   /** Runs one turn; "held" means a queued message was refused by a lock and put back on hold. */
   const run = useCallback(
     async (message?: QueuedMessage): Promise<"held" | undefined> => {

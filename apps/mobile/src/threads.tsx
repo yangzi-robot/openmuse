@@ -24,6 +24,8 @@ function newThreadId() {
 export type Selection = { id: string; existing: boolean };
 const ThreadContext = createContext<{
   enabled: boolean;
+  rich: boolean;
+  local: boolean;
   selection: Selection;
   visited: Selection[];
   mainId: string;
@@ -37,7 +39,9 @@ const ThreadContext = createContext<{
 export function ThreadsProvider({ children }: { children: ReactNode }) {
   const { workspace, navigate, api } = useWorkspace();
   const handledPrompt = useRef(0);
-  const enabled = workspace.runtime.richThreads === true;
+  const rich = workspace.runtime.richThreads === true;
+  const local = !rich && workspace.runtime.localThreads === true;
+  const enabled = rich || local;
   const [selection, setSelection] = useState<Selection>({ id: "local", existing: false });
   const [visited, setVisited] = useState<Selection[]>([]);
   const [mainId, setMainId] = useState("local");
@@ -71,6 +75,17 @@ export function ThreadsProvider({ children }: { children: ReactNode }) {
     setVisited((items) => (items.some((item) => item.id === next.id) ? items : [...items, next]));
     navigate("chat");
   }
+  function start() {
+    if (!local) {
+      select({ id: newThreadId(), existing: false });
+      return;
+    }
+    setError("");
+    void api
+      .request<{ id: string }>("/api/conversations", {}, "POST")
+      .then((conversation) => select({ id: conversation.id, existing: false }))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }
   return (
     <ThreadContext.Provider
       value={{
@@ -80,6 +95,8 @@ export function ThreadsProvider({ children }: { children: ReactNode }) {
           return true;
         },
         enabled,
+        rich,
+        local,
         mainId,
         visited,
         loading,
@@ -87,7 +104,7 @@ export function ThreadsProvider({ children }: { children: ReactNode }) {
         retry: () => setAttempt((n) => n + 1),
         selection,
         select,
-        start: () => select({ id: newThreadId(), existing: false }),
+        start,
       }}
     >
       {children}
@@ -102,6 +119,8 @@ export function useMuseThread() {
 export function ThreadsSheet({ onClose }: { onClose: () => void }) {
   const {
     enabled,
+    rich,
+    local,
     selection,
     visited,
     mainId,
@@ -111,12 +130,50 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
     select,
     start,
   } = useMuseThread();
-  const { workspace, open, navigate, refresh } = useWorkspace();
-  const threads = useThreads({ agentId: "default", enabled, includeArchived: true, limit: 20 });
+  const { workspace, open, navigate, refresh, api } = useWorkspace();
+  const threads = useThreads({ agentId: "default", enabled: rich, includeArchived: true, limit: 20 });
+  const [localItems, setLocalItems] = useState<
+    { id: string; name: string; archived: boolean; updatedAt: string }[]
+  >([]);
+  const [localLoading, setLocalLoading] = useState(local);
+  const [localError, setLocalError] = useState("");
+  const [localMutating, setLocalMutating] = useState(false);
   const [editing, setEditing] = useState<string>();
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [archived, setArchived] = useState(false);
+  const loadLocal = async () => {
+    if (!local) return;
+    setLocalLoading(true);
+    setLocalError("");
+    try {
+      setLocalItems(
+        await api.request<{ id: string; name: string; archived: boolean; updatedAt: string }[]>(
+          "/api/conversations",
+        ),
+      );
+    } catch (e) {
+      setLocalError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+  useEffect(() => {
+    void loadLocal();
+  }, [api, local]);
+  const savedThreads = rich ? threads.threads : localItems;
+  const threadsLoading = rich ? threads.isLoading : localLoading;
+  const threadsError = rich ? threads.error?.message || "" : localError;
+  const isMutating = rich ? threads.isMutating : localMutating;
+  async function patchLocal(id: string, patch: { name?: string; archived?: boolean }) {
+    setLocalMutating(true);
+    try {
+      await api.request(`/api/conversations/${encodeURIComponent(id)}`, patch, "PATCH");
+      await loadLocal();
+    } finally {
+      setLocalMutating(false);
+    }
+  }
   async function mutate(action: () => Promise<void>) {
     setError("");
     try {
@@ -173,10 +230,10 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                 {archived ? "Show active" : "Archived"}
               </Button>
             </View>
-            {threads.isLoading && <ActivityIndicator color={colors.blueDark} />}
-            <ErrorNotice error={error || threads.error?.message} />
-            {threads.error && (
-              <Button small onPress={threads.refetchThreads}>
+            {threadsLoading && <ActivityIndicator color={colors.blueDark} />}
+            <ErrorNotice error={error || threadsError} />
+            {!!threadsError && (
+              <Button small onPress={() => (rich ? threads.refetchThreads() : void loadLocal())}>
                 Retry conversations
               </Button>
             )}
@@ -184,7 +241,7 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
               visited
                 .filter(
                   (item) =>
-                    item.id !== mainId && !threads.threads.some((saved) => saved.id === item.id),
+                    item.id !== mainId && !savedThreads.some((saved) => saved.id === item.id),
                 )
                 .map((item, index) => (
                   <LinkRow
@@ -198,7 +255,7 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                     }}
                   />
                 ))}
-            {threads.threads
+            {savedThreads
               .filter((thread) => thread.id !== mainId && thread.archived === archived)
               .map((thread) => (
                 <View
@@ -231,10 +288,14 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                   <View style={[s.row, { gap: 8 }]}>
                     <Button
                       small
-                      disabled={threads.isMutating || (editing === thread.id && !name.trim())}
+                      disabled={isMutating || (editing === thread.id && !name.trim())}
                       onPress={() => {
                         if (editing === thread.id)
-                          void mutate(() => threads.renameThread(thread.id, name.trim()));
+                          void mutate(() =>
+                            rich
+                              ? threads.renameThread(thread.id, name.trim())
+                              : patchLocal(thread.id, { name: name.trim() }),
+                          );
                         else {
                           setEditing(thread.id);
                           setName(thread.name || "");
@@ -246,12 +307,14 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                     <Button
                       small
                       icon={Archive}
-                      disabled={threads.isMutating}
+                      disabled={isMutating}
                       onPress={() =>
                         void mutate(() =>
-                          thread.archived
-                            ? threads.unarchiveThread(thread.id)
-                            : threads.archiveThread(thread.id),
+                          rich
+                            ? thread.archived
+                              ? threads.unarchiveThread(thread.id)
+                              : threads.archiveThread(thread.id)
+                            : patchLocal(thread.id, { archived: !thread.archived }),
                         )
                       }
                     >
@@ -260,9 +323,9 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                   </View>
                 </View>
               ))}
-            {!threads.isLoading &&
-              !threads.error &&
-              !threads.threads.some(
+            {!threadsLoading &&
+              !threadsError &&
+              !savedThreads.some(
                 (thread) => thread.id !== mainId && thread.archived === archived,
               ) && (
                 <Text style={s.muted}>
@@ -271,8 +334,8 @@ export function ThreadsSheet({ onClose }: { onClose: () => void }) {
                     : "Keep a separate topic here. Your main chat is always available."}
                 </Text>
               )}
-            <ErrorNotice error={threads.fetchMoreError?.message} />
-            {threads.hasMoreThreads && (
+            {rich && <ErrorNotice error={threads.fetchMoreError?.message} />}
+            {rich && threads.hasMoreThreads && (
               <Button small busy={threads.isFetchingMoreThreads} onPress={threads.fetchMoreThreads}>
                 Load more conversations
               </Button>
